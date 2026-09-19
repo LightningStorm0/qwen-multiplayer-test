@@ -1,11 +1,19 @@
 extends Node
 ## Entry point: builds the world, hosts the server, and manages the network lifecycle.
 ##
+## A minimal first-person shooter: server-authoritative hitscan shooting with
+## client-side movement prediction.
+##
 ## Usage:
 ##   Server (listen, you can also play locally):  godot --path .
 ##   Headless dedicated server:                   godot --headless --path .
 ##   Client:                                      godot --path . -- +client [ip]
 ##   (default ip is 127.0.0.1)
+##   Note: user args come after `--` (Godot convention).
+##
+## Controls: WASD/arrows move, Space jump, mouse aim (captured), LMB shoot,
+##   ESC releases the mouse, click to re-capture. 100 HP, 25 damage per shot,
+##   3 s respawn.
 ##
 ## Note (Godot 4.7 fork specifics): the high-level multiplayer API here is
 ## ENetMultiplayerPeer + set_multiplayer_peer(), manual multiplayer.poll() every
@@ -19,15 +27,25 @@ var _players: Dictionary = {}  # peer_id -> CharacterBody3D
 var _player_colors: Dictionary = {}  # peer_id -> Color
 var _players_node: Node3D
 var _status_label: Label
+var _crosshair: Label
+var _hp_label: Label
+var _event_label: Label
+var _capture_hint: Label
+var _hit_flash: ColorRect
+var _death_overlay: ColorRect
+var _death_label: Label
 var _is_client := false
 var _connected_as_client := false
 var _target_ip := "127.0.0.1"
 var _debugpos := false
 var _debug_acc := 0.0
+var _local_pid := 1
+var _local_dead := false
+var _event_time := 0.0
+var _flash_alpha := 0.0
 # Cached at startup: querying multiplayer.is_server()/get_unique_id() after the
 # ENet peer has been deactivated (connection lost) raises engine errors.
 var _is_server := false
-var _local_pid := -1
 
 
 func _ready() -> void:
@@ -55,7 +73,9 @@ func _ready() -> void:
 	multiplayer.peer_disconnected.connect(_on_peer_disconnected)
 
 	if _is_server:
+		_local_pid = 1
 		_spawn_player(1)
+		_capture_mouse()
 	_update_hud()
 
 
@@ -70,9 +90,24 @@ func _process(dt: float) -> void:
 			var others := {}
 			for pid in _players:
 				if int(pid) != _local_pid:
-					others[pid] = _players[pid].position
-			if not others.is_empty():
-				print("REMOTE POS: ", others)
+					others[pid] = "%s hp=%d dead=%s" % [_players[pid].position, _players[pid].health, _players[pid].dead]
+			print("REMOTE POS: ", others)
+	# HUD timers.
+	if _event_time > 0.0:
+		_event_time -= dt
+		if _event_time <= 0.0:
+			_event_label.text = ""
+	if _flash_alpha > 0.0:
+		_flash_alpha = maxf(_flash_alpha - dt * 1.5, 0.0)
+		_hit_flash.color.a = _flash_alpha
+	# Mouse capture: re-capture on click when released (local player alive).
+	if _has_local_player() and not _local_dead:
+		if Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
+			_capture_hint.visible = false
+		else:
+			_capture_hint.visible = true
+			if Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
+				_capture_mouse()
 
 
 # --- Network setup ---
@@ -90,6 +125,29 @@ func _start_client() -> void:
 	if peer.create_client(_target_ip, SERVER_PORT) != OK:
 		push_error("Failed to start the client (target %s:%d)" % [_target_ip, SERVER_PORT])
 	multiplayer.set_multiplayer_peer(peer)
+
+
+func _has_local_player() -> bool:
+	if _is_server:
+		return true
+	return _local_pid > 1
+
+
+func _capture_mouse() -> void:
+	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+
+
+func _release_mouse() -> void:
+	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+
+
+func _on_focus_entered() -> void:
+	if _has_local_player() and not _local_dead:
+		_capture_mouse()
+
+
+func _on_focus_exited() -> void:
+	_release_mouse()
 
 
 # --- World building (shared by server and clients) ---
@@ -169,8 +227,59 @@ func _build_hud() -> void:
 	var hint := Label.new()
 	hint.position = Vector2(12, 34)
 	hint.add_theme_font_size_override("font_size", 14)
-	hint.text = "WASD / arrow keys: move | Space: jump | You are the colored block the camera follows"
+	hint.text = "WASD: move | Space: jump | Mouse: aim | LMB: shoot | ESC: release mouse, click to re-capture"
 	layer.add_child(hint)
+	_crosshair = Label.new()
+	_crosshair.text = "+"
+	_crosshair.add_theme_font_size_override("font_size", 22)
+	_crosshair.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_crosshair.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	_crosshair.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	layer.add_child(_crosshair)
+	_hp_label = Label.new()
+	_hp_label.text = "HP 100/100"
+	_hp_label.add_theme_font_size_override("font_size", 20)
+	_hp_label.set_anchors_and_offsets_preset(Control.PRESET_BOTTOM_LEFT)
+	_hp_label.position = Vector2(12, -44)
+	layer.add_child(_hp_label)
+	_event_label = Label.new()
+	_event_label.add_theme_font_size_override("font_size", 18)
+	_event_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_event_label.set_anchors_and_offsets_preset(Control.PRESET_CENTER_TOP)
+	_event_label.position = Vector2(-200, 12)
+	_event_label.size = Vector2(400, 30)
+	layer.add_child(_event_label)
+	_capture_hint = Label.new()
+	_capture_hint.text = "Mouse released - click to capture"
+	_capture_hint.add_theme_font_size_override("font_size", 16)
+	_capture_hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_capture_hint.set_anchors_and_offsets_preset(Control.PRESET_BOTTOM_WIDE)
+	_capture_hint.position = Vector2(0, -34)
+	_capture_hint.visible = false
+	layer.add_child(_capture_hint)
+	_hit_flash = ColorRect.new()
+	_hit_flash.color = Color(1, 0.1, 0.1, 0.0)
+	_hit_flash.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_hit_flash.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	layer.add_child(_hit_flash)
+	_death_overlay = ColorRect.new()
+	_death_overlay.color = Color(0, 0, 0, 0.65)
+	_death_overlay.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_death_overlay.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_death_overlay.visible = false
+	layer.add_child(_death_overlay)
+	_death_label = Label.new()
+	_death_label.text = "YOU DIED\nrespawning..."
+	_death_label.add_theme_font_size_override("font_size", 32)
+	_death_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_death_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	_death_label.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_death_label.visible = false
+	layer.add_child(_death_label)
+	# Window focus drives mouse capture/release.
+	var win := get_window()
+	win.focus_entered.connect(_on_focus_entered)
+	win.focus_exited.connect(_on_focus_exited)
 
 
 func _update_hud() -> void:
@@ -184,6 +293,13 @@ func _update_hud() -> void:
 		]
 	else:
 		_status_label.text = "Connecting to %s:%d..." % [_target_ip, SERVER_PORT]
+
+
+func _show_event(text: String) -> void:
+	if _event_label == null:
+		return
+	_event_label.text = text
+	_event_time = 3.0
 
 
 # --- Player management ---
@@ -230,6 +346,8 @@ func _on_connected_to_server() -> void:
 	print("Connected to server as peer %d" % _local_pid)
 	_connected_as_client = true
 	multiplayer.rpc(1, self, "rpc_register", [])
+	_hp_label.text = "HP 100/100"
+	_capture_mouse()
 	_update_hud()
 
 
@@ -266,12 +384,78 @@ func _on_connection_lost() -> void:
 	var keys: Array = _players.keys()
 	for pid in keys:
 		_remove_player(pid)
+	_local_pid = -1
 	_update_hud()
 
 
+# --- Combat notifications (server -> clients + own HUD) ---
+# Called by the Player script when the server resolves a hit/death/respawn.
+# The RPC updates the remote clients; the _apply_* call updates this machine.
+
+
+func _on_player_hit(target: int, health: int, shooter: int) -> void:
+	multiplayer.rpc(0, self, "rpc_hit", [target, health, shooter])
+	_apply_hit_state(target, health, shooter)
+
+
+func _on_player_death(target: int, shooter: int) -> void:
+	multiplayer.rpc(0, self, "rpc_death", [target, shooter])
+	_apply_death_state(target, shooter)
+
+
+func _on_player_respawn(target: int, pos: Vector3) -> void:
+	multiplayer.rpc(0, self, "rpc_respawn", [target, pos])
+	_apply_respawn_state(target, pos)
+
+
+func _apply_hit_state(target: int, health: int, shooter: int) -> void:
+	var p: Node = _players.get(target)
+	if p != null:
+		p.set_health(health)
+	if target == _local_pid:
+		_hp_label.text = "HP %d/100" % health
+		_flash_alpha = 0.35
+		_hit_flash.color.a = _flash_alpha
+		_show_event("Player %d hit you (HP %d)" % [shooter, health])
+	elif shooter == _local_pid:
+		_show_event("You hit player %d (HP %d)" % [target, health])
+
+
+func _apply_death_state(target: int, shooter: int) -> void:
+	var p: Node = _players.get(target)
+	if p != null:
+		p.set_dead(true)
+	if target == _local_pid:
+		_local_dead = true
+		_hp_label.text = "HP 0/100"
+		_death_overlay.visible = true
+		_death_label.visible = true
+		_release_mouse()
+		_show_event("You were eliminated by player %d" % shooter)
+	elif shooter == _local_pid:
+		_show_event("You eliminated player %d!" % target)
+	else:
+		_show_event("Player %d eliminated player %d" % [shooter, target])
+
+
+func _apply_respawn_state(target: int, pos: Vector3) -> void:
+	var p: Node = _players.get(target)
+	if p != null:
+		p.set_alive(pos)
+	if target == _local_pid:
+		_local_dead = false
+		_hp_label.text = "HP 100/100"
+		_death_overlay.visible = false
+		_death_label.visible = false
+		var win := get_window()
+		if win != null and win.has_focus():
+			_capture_mouse()
+
+
 # --- RPCs ---
-# rpc_register is called by clients and runs on the server.
-# rpc_players_full / rpc_player_joined / rpc_player_left / rpc_snapshot / rpc_pong run on the clients.
+# rpc_register / rpc_send_input are called by clients and run on the server.
+# rpc_players_full / rpc_player_joined / rpc_player_left / rpc_snapshot /
+# rpc_hit / rpc_death / rpc_respawn run on the clients.
 
 
 @rpc("any_peer", "call_remote", "reliable")
@@ -285,7 +469,7 @@ func rpc_register() -> void:
 	var data := {}
 	for p_id in _players:
 		var node: Node = _players[p_id]
-		data[p_id] = {"pos": node.position, "color": _player_colors[p_id]}
+		data[p_id] = {"pos": node.position, "color": _player_colors[p_id], "health": node.health, "dead": node.dead}
 	multiplayer.rpc(0, self, "rpc_players_full", [data])
 
 
@@ -296,8 +480,13 @@ func rpc_players_full(data: Dictionary) -> void:
 	for pid in data:
 		if not _players.has(pid):
 			var info: Dictionary = data[pid]
-			_player_colors[pid] = info["color"]
-			_add_player(int(pid), info["pos"], info["color"])
+			var p_id: int = int(pid)
+			_player_colors[p_id] = info["color"]
+			_add_player(p_id, info["pos"], info["color"])
+			var p: Node = _players[p_id]
+			p.set_health(int(info.get("health", 100)))
+			if info.get("dead", false):
+				p.set_dead(true)
 	_update_hud()
 
 
@@ -333,7 +522,7 @@ func rpc_snapshot(pid: int, pos: Vector3, vel: Vector3, yaw: float, ack_tick: in
 
 
 @rpc("any_peer", "call_remote", "unreliable_ordered")
-func rpc_send_input(dir: Vector2, jump: bool, tick: int) -> void:
+func rpc_send_input(dir: Vector2, jump: bool, tick: int, yaw: float, pitch: float, shooting: bool) -> void:
 	if not _is_server:
 		return
 	var pid: int = multiplayer.get_remote_sender_id()
@@ -344,3 +533,27 @@ func rpc_send_input(dir: Vector2, jump: bool, tick: int) -> void:
 		p.ack_tick = tick
 		p.pending_input_dir = dir
 		p.pending_input_jump = jump
+		p.pending_input_shooting = shooting
+		p.rotation.y = yaw
+		p.aim_pitch = pitch
+
+
+@rpc("authority", "call_remote", "reliable")
+func rpc_hit(target: int, health: int, shooter: int) -> void:
+	if _is_server:
+		return
+	_apply_hit_state(target, health, shooter)
+
+
+@rpc("authority", "call_remote", "reliable")
+func rpc_death(target: int, shooter: int) -> void:
+	if _is_server:
+		return
+	_apply_death_state(target, shooter)
+
+
+@rpc("authority", "call_remote", "reliable")
+func rpc_respawn(target: int, pos: Vector3) -> void:
+	if _is_server:
+		return
+	_apply_respawn_state(target, pos)
